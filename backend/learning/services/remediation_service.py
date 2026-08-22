@@ -38,14 +38,15 @@ REMEDIATION_SCHEMA = {
 }
 
 
-def generate_remediation_lesson(assessment_attempt_id=None, micro_module_id=None):
+def generate_remediation_lesson(assessment_attempt_id=None, micro_module_id=None, chapter_id=None):
     """
     Generate a focused remediation review lesson for missed questions on an assessment attempt.
+    Supports MicroModule and Chapter assessments.
     """
     attempt = None
     if assessment_attempt_id:
         try:
-            attempt = AssessmentAttempt.objects.select_related("assessment__micro_module").get(pk=assessment_attempt_id)
+            attempt = AssessmentAttempt.objects.select_related("assessment__micro_module", "assessment__chapter").get(pk=assessment_attempt_id)
         except (AssessmentAttempt.DoesNotExist, ValueError):
             pass
 
@@ -57,13 +58,38 @@ def generate_remediation_lesson(assessment_attempt_id=None, micro_module_id=None
         except ValueError:
             pass
 
+    if not attempt and chapter_id:
+        try:
+            attempt = AssessmentAttempt.objects.filter(
+                assessment__chapter_id=chapter_id
+            ).order_by("-created_at").first()
+        except ValueError:
+            pass
+
     if not attempt:
-        raise ValueError("Valid assessment_attempt_id or micro_module_id with attempt history is required.")
+        raise ValueError("Valid assessment_attempt_id, micro_module_id, or chapter_id with attempt history is required.")
 
     assessment = attempt.assessment
     micro_module = assessment.micro_module
-    source_text = assessment.source_text or (micro_module.source_text if micro_module else "")
-    title = assessment.title or (micro_module.title if micro_module else "Remediation Lesson")
+    chapter = assessment.chapter
+
+    source_text = assessment.source_text
+    if not source_text:
+        if micro_module:
+            source_text = micro_module.source_text or ""
+        elif chapter:
+            source_text = chapter.source_text or "\n\n".join(
+                mm.source_text for mm in chapter.micro_modules.all() if mm.source_text
+            )
+
+    title = assessment.title
+    if not title:
+        if micro_module:
+            title = micro_module.title
+        elif chapter:
+            title = chapter.title
+        else:
+            title = "Remediation Lesson"
 
     detailed_results = attempt.detailed_results or []
     failed_questions = [r for r in detailed_results if not r.get("is_correct", False)]
@@ -72,17 +98,18 @@ def generate_remediation_lesson(assessment_attempt_id=None, micro_module_id=None
         # If student passed with 100%, return positive reinforcement summary
         return {
             "micro_module_id": str(micro_module.id) if micro_module else "",
+            "chapter_id": str(chapter.id) if chapter else "",
             "title": title,
             "missed_concepts_summary": ["No concepts were missed! Excellent work."],
             "remediation_explanation": [
                 {
                     "heading": "Mastery Confirmed",
-                    "content": f"You scored {attempt.score}/{attempt.total_questions} ({attempt.percentage}%). You have mastered this micro-module."
+                    "content": f"You scored {attempt.score}/{attempt.total_questions} ({attempt.percentage}%). You have mastered this material."
                 }
             ],
             "key_takeaways_to_remember": [
                 "Review complete.",
-                "You are ready to progress to the next micro-module."
+                "You are ready to progress to the next stage."
             ]
         }
 
@@ -162,6 +189,7 @@ Write a focused remediation review lesson that explains ONLY the concepts missed
     parsed = json.loads(payload["message"]["content"])
 
     parsed["micro_module_id"] = str(micro_module.id) if micro_module else ""
+    parsed["chapter_id"] = str(chapter.id) if chapter else ""
     parsed["title"] = title
     parsed["attempt_score"] = f"{attempt.score}/{attempt.total_questions} ({attempt.percentage}%)"
 

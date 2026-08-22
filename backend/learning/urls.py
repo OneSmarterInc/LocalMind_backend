@@ -1,14 +1,27 @@
 from django.urls import path
+
 from .views import (
     AssessmentDetailView,
     AssessmentGenerateView,
     AssessmentSubmitView,
+    ChapterDetailView,
     MicroModuleDetailView,
     MicroModuleListCreateView,
+    ModuleDetailView,
     RemediationGenerateView,
 )
 
 urlpatterns = [
+    path(
+        "chapters/<uuid:chapter_id>/",
+        ChapterDetailView.as_view(),
+        name="chapter-detail",
+    ),
+    path(
+        "modules/<uuid:module_id>/",
+        ModuleDetailView.as_view(),
+        name="module-detail",
+    ),
     path(
         "micro-modules/",
         MicroModuleListCreateView.as_view(),
@@ -45,4 +58,3 @@ urlpatterns = [
         name="remediation-generate",
     ),
 ]
-

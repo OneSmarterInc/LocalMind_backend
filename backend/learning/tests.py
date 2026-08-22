@@ -1,7 +1,8 @@
 from unittest.mock import patch
 from django.test import TestCase
 from django.urls import reverse
-from learning.models import Assessment, AssessmentAttempt, MicroModule
+from documents.models import Document
+from learning.models import Assessment, AssessmentAttempt, Chapter, LearningModule, MicroModule
 from learning.services.scoring_service import grade_assessment_attempt
 
 
@@ -94,8 +95,6 @@ class HybridScoringTests(TestCase):
 
     @patch("learning.services.scoring_service.evaluate_subjective_answer")
     def test_borderline_70_percent_passes(self, mock_eval):
-        """2/2 = 100% for a test with 2 questions; 1/2 = 50% fails. Simulate a borderline pass."""
-        # Create a 10-question assessment (7/10 = 70%) using only MCQs for deterministic test
         mcq_questions = [
             {"id": f"q{i}", "type": "mcq", "question": f"Q{i}", "options": [
                 {"key": "A", "text": "Correct"}, {"key": "B", "text": "Wrong"},
@@ -106,7 +105,6 @@ class HybridScoringTests(TestCase):
         assessment = Assessment.objects.create(
             micro_module=self.mm, title="Borderline", questions_data=mcq_questions, pass_percentage=70
         )
-        # 7 correct out of 10 = 70.0% — exactly at threshold, should pass
         submitted = {f"q{i}": "A" if i <= 7 else "B" for i in range(1, 11)}
         attempt = grade_assessment_attempt(assessment, submitted)
         self.assertEqual(attempt.percentage, 70.0)
@@ -133,13 +131,11 @@ class RemediationApiTests(TestCase):
     def test_remediation_generated_for_failed_attempt(self, mock_eval):
         mock_eval.return_value = {"is_correct": False, "score_awarded": 0.0, "feedback": "Wrong.", "missing_points": ["Force concept."]}
 
-        # Create a failed attempt
         attempt = grade_assessment_attempt(self.assessment, {"q1": "D", "s1": "I don't know."})
         self.assertFalse(attempt.passed)
 
         url = reverse("remediation-generate")
 
-        # Mock Ollama remediation call
         with patch("learning.services.remediation_service.requests.post") as mock_post:
             mock_post.return_value.status_code = 200
             mock_post.return_value.raise_for_status = lambda: None
@@ -169,13 +165,57 @@ class RemediationApiTests(TestCase):
             {"micro_module_id": str(self.mm.id)},
             content_type="application/json"
         )
-        # No attempt exists yet — should return 400
         self.assertEqual(res.status_code, 400)
 
     def test_remediation_missing_params_returns_400(self):
         url = reverse("remediation-generate")
         res = self.client.post(url, {}, content_type="application/json")
         self.assertEqual(res.status_code, 400)
+
+
+class ChapterAndLearningModuleTests(TestCase):
+
+    def setUp(self):
+        self.doc = Document.objects.create(
+            title="Physics Book",
+            original_name="physics.pdf",
+            file_type="pdf",
+        )
+        self.chapter = Chapter.objects.create(
+            document=self.doc,
+            title="Chapter 1: Mechanics",
+            order=1,
+            source_text="This is chapter 1 source text.",
+            start_page=1,
+            end_page=10,
+        )
+        self.module = LearningModule.objects.create(
+            chapter=self.chapter,
+            title="Module 1.1: Newton's Laws",
+            order=1,
+            source_text="Newton's laws module text.",
+            start_page=1,
+            end_page=5,
+        )
+
+    def test_chapter_detail_view(self):
+        url = reverse("chapter-detail", kwargs={"chapter_id": self.chapter.id})
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["title"], "Chapter 1: Mechanics")
+        self.assertEqual(data["source_text"], "This is chapter 1 source text.")
+        self.assertEqual(len(data["modules"]), 1)
+        self.assertEqual(data["modules"][0]["title"], "Module 1.1: Newton's Laws")
+
+    def test_module_detail_view(self):
+        url = reverse("module-detail", kwargs={"module_id": self.module.id})
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["title"], "Module 1.1: Newton's Laws")
+        self.assertEqual(data["source_text"], "Newton's laws module text.")
+        self.assertEqual(data["chapter_id"], str(self.chapter.id))
 
 
 class AssessmentFreshQuestionsTests(TestCase):
@@ -188,7 +228,6 @@ class AssessmentFreshQuestionsTests(TestCase):
 
     @patch("learning.views.generate_assessment_questions")
     def test_previous_questions_passed_on_retest(self, mock_gen):
-        # Set 1 from first assessment
         mock_gen.return_value = [
             {"id": "q1", "type": "mcq", "question": "What stays at rest?",
              "options": [{"key": "A", "text": "A"}, {"key": "B", "text": "B"}, {"key": "C", "text": "C"}, {"key": "D", "text": "D"}],
@@ -196,16 +235,10 @@ class AssessmentFreshQuestionsTests(TestCase):
         ]
 
         url = reverse("assessment-generate")
-
-        # First assessment
         self.client.post(url, {"micro_module_id": str(self.mm.id)}, content_type="application/json")
-
-        # Second assessment (retest) — should pass previous questions
         self.client.post(url, {"micro_module_id": str(self.mm.id)}, content_type="application/json")
 
         self.assertEqual(mock_gen.call_count, 2)
-
-        # Verify second call had non-empty previous_questions list
         second_call_kwargs = mock_gen.call_args_list[1][1]
         prev_q = second_call_kwargs.get("previous_questions", [])
         self.assertGreater(len(prev_q), 0)

@@ -1,117 +1,209 @@
+import html
 from pathlib import Path
+
 from django.db import transaction
-from learning.models import LearningModule, Chapter
-from .ollama import generate_outline_with_ollama
+
+from learning.models import Chapter, LearningModule, MicroModule
+
 
 def _clean_title(value):
-    return " ".join(str(value or "").split()).strip()
+    value = html.unescape(str(value or ""))
+    return " ".join(value.split()).strip()
 
-def _heuristic_outline(original_name, headings):
+
+def _section_lookup(sections):
+    return {section["index"]: section for section in sections}
+
+
+def _choose_chapter_level(sections):
     """
-    Safe fallback if Ollama is unavailable.
+    Respect the source document hierarchy exactly.
 
-    Top-level detected headings become chapters and are grouped into
-    learning modules of up to four chapters.
+    The shallowest heading level is the chapter level. We intentionally do NOT
+    demote a single H1 to H2. In Word, Heading 1 is the author's explicit
+    highest-level outline choice.
+    """
+    levels = [section["level"] for section in sections if section.get("level")]
+    return min(levels) if levels else None
+
+
+def _source_hierarchy_outline(original_name, sections):
+    """
+    Build Document -> Chapter -> Module directly from the source hierarchy.
+
+    Rules:
+      * shallowest source heading level -> Chapter
+      * immediate next available heading level inside that chapter -> Module
+      * deeper headings stay inside Module.source_text as subheadings/content
     """
     default_title = Path(original_name).stem
 
-    if not headings:
-        return {
-            "document_title": default_title,
-            "modules": [{
-                "title": "Module 1",
-                "chapters": [{"title": "Document Content"}],
-            }],
-        }
+    if not sections:
+        raise ValueError("No source sections are available to persist.")
 
-    min_level = min(item["level"] for item in headings)
-    top = [
-        _clean_title(item["title"])
-        for item in headings
-        if item["level"] == min_level and _clean_title(item["title"])
+    chapter_level = _choose_chapter_level(sections)
+    chapter_sections = [
+        section
+        for section in sections
+        if section["level"] == chapter_level
     ]
 
-    # If there is only one top heading (often the book title),
-    # use the next heading level for chapters.
-    if len(top) <= 1:
-        next_level = min_level + 1
-        second_level = [
-            _clean_title(item["title"])
-            for item in headings
-            if item["level"] == next_level and _clean_title(item["title"])
+    if not chapter_sections:
+        chapter_sections = [sections[0]]
+        chapter_level = sections[0]["level"]
+
+    chapters = []
+
+    for position, chapter_section in enumerate(chapter_sections):
+        next_chapter_index = (
+            chapter_sections[position + 1]["index"]
+            if position + 1 < len(chapter_sections)
+            else float("inf")
+        )
+
+        nested = [
+            section
+            for section in sections
+            if chapter_section["index"] < section["index"] < next_chapter_index
+            and section["level"] > chapter_level
         ]
-        if second_level:
-            top = second_level
 
-    if not top:
-        top = [_clean_title(item["title"]) for item in headings[:20]]
+        modules = []
+        if nested:
+            module_level = min(section["level"] for section in nested)
+            modules = [
+                {
+                    "title": _clean_title(section["title"]),
+                    "source_heading_index": section["index"],
+                }
+                for section in nested
+                if section["level"] == module_level
+            ]
 
-    # Remove exact consecutive duplicates while preserving order.
-    cleaned = []
-    for title in top:
-        if title and (not cleaned or cleaned[-1] != title):
-            cleaned.append(title)
+        chapters.append(
+            {
+                "title": _clean_title(chapter_section["title"]),
+                "source_heading_index": chapter_section["index"],
+                "modules": modules,
+            }
+        )
 
-    modules = []
-    chunk_size = 4
-    for index in range(0, len(cleaned), chunk_size):
-        chapters = cleaned[index:index + chunk_size]
-        modules.append({
-            "title": f"Module {len(modules) + 1}",
-            "chapters": [{"title": title} for title in chapters],
-        })
+    document_title = (
+        chapters[0]["title"] if len(chapters) == 1 else default_title
+    )
 
     return {
-        "document_title": default_title,
-        "modules": modules or [{
-            "title": "Module 1",
-            "chapters": [{"title": "Document Content"}],
-        }],
+        "document_title": document_title,
+        "chapters": chapters,
     }
 
-def build_proposed_outline(document, headings):
-    ai_outline = generate_outline_with_ollama(document.original_name, headings)
-    if ai_outline:
-        return ai_outline, "ollama"
 
-    return _heuristic_outline(document.original_name, headings), "heuristic"
+def build_proposed_outline(document, sections):
+    return (
+        _source_hierarchy_outline(document.original_name, sections),
+        "source_hierarchy",
+    )
+
 
 @transaction.atomic
-def replace_outline(document, outline, user_edited=False):
-    modules = outline.get("modules") or []
-    if not modules:
-        raise ValueError("The outline must contain at least one module.")
+def replace_outline(document, outline, sections=None, user_edited=False):
+    """
+    Persist Chapter -> Module/MicroModule rows in SQLite.
 
-    LearningModule.objects.filter(document=document).delete()
+    source_text always comes from parsed source sections when a
+    source_heading_index exists. It is never replaced with a summary.
+    """
+    chapters = outline.get("chapters") or []
+    if not chapters:
+        raise ValueError("The outline must contain at least one chapter.")
 
-    for module_index, module_data in enumerate(modules, start=1):
-        module_title = _clean_title(module_data.get("title"))
-        chapters = module_data.get("chapters") or []
+    sections = sections or []
+    lookup = _section_lookup(sections)
 
-        if not module_title:
-            raise ValueError(f"Module {module_index} needs a title.")
+    Chapter.objects.filter(document=document).delete()
 
-        if not chapters:
-            raise ValueError(f'"{module_title}" must contain at least one chapter.')
+    for chapter_order, chapter_data in enumerate(chapters, start=1):
+        chapter_title = _clean_title(chapter_data.get("title"))
+        modules = chapter_data.get("modules") or []
 
-        module = LearningModule.objects.create(
+        if not chapter_title:
+            raise ValueError(f"Chapter {chapter_order} needs a title.")
+
+        source_index = chapter_data.get("source_heading_index")
+        source_section = lookup.get(source_index)
+
+        chapter = Chapter.objects.create(
             document=document,
-            title=module_title,
-            order=module_index,
+            title=chapter_title,
+            order=chapter_order,
+            source_heading_index=source_index if source_section else None,
+            source_text=(
+                source_section.get("source_text", "")
+                if source_section
+                else str(chapter_data.get("source_text") or "")
+            ),
+            start_page=(
+                source_section.get("start_page")
+                if source_section
+                else chapter_data.get("start_page")
+            ),
+            end_page=(
+                source_section.get("end_page")
+                if source_section
+                else chapter_data.get("end_page")
+            ),
             is_user_edited=user_edited,
         )
 
-        for chapter_index, chapter_data in enumerate(chapters, start=1):
-            chapter_title = _clean_title(chapter_data.get("title"))
-            if not chapter_title:
+        for module_order, module_data in enumerate(modules, start=1):
+            module_title = _clean_title(module_data.get("title"))
+            if not module_title:
                 raise ValueError(
-                    f'Chapter {chapter_index} in "{module_title}" needs a title.'
+                    f'Module {module_order} in "{chapter_title}" needs a title.'
                 )
 
-            Chapter.objects.create(
-                module=module,
-                title=chapter_title,
-                order=chapter_index,
+            module_source_index = module_data.get("source_heading_index")
+            module_source = lookup.get(module_source_index)
+
+            mod_source_text = (
+                module_source.get("source_text", "")
+                if module_source
+                else str(module_data.get("source_text") or "")
+            )
+            mod_start_page = (
+                module_source.get("start_page")
+                if module_source
+                else module_data.get("start_page")
+            )
+            mod_end_page = (
+                module_source.get("end_page")
+                if module_source
+                else module_data.get("end_page")
+            )
+
+            # Persist LearningModule
+            LearningModule.objects.create(
+                chapter=chapter,
+                title=module_title,
+                order=module_order,
+                source_heading_index=(
+                    module_source_index if module_source else None
+                ),
+                source_text=mod_source_text,
+                start_page=mod_start_page,
+                end_page=mod_end_page,
+                is_user_edited=user_edited,
+            )
+
+            # Also create corresponding MicroModule so tutoring & assessments can seamlessly reference it
+            MicroModule.objects.create(
+                chapter=chapter,
+                document=document,
+                title=module_title,
+                order=module_order,
+                source_text=mod_source_text,
+                start_page=mod_start_page,
+                end_page=mod_end_page,
                 is_user_edited=user_edited,
             )
 

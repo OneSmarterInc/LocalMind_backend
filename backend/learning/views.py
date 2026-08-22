@@ -1,16 +1,42 @@
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Assessment, AssessmentAttempt, MicroModule
+from .models import Assessment, AssessmentAttempt, Chapter, LearningModule, MicroModule
 from .serializers import (
     AssessmentAttemptSerializer,
     AssessmentSerializer,
+    ChapterSerializer,
+    LearningModuleSerializer,
     MicroModuleSerializer,
 )
 from .services.assessment_service import generate_assessment_questions
+from .services.remediation_service import generate_remediation_lesson
 from .services.scoring_service import grade_assessment_attempt
+
+
+class ChapterDetailView(APIView):
+    """Return one persisted chapter with its complete source text and modules."""
+
+    def get(self, request, chapter_id):
+        chapter = get_object_or_404(
+            Chapter.objects.prefetch_related("modules"),
+            pk=chapter_id,
+        )
+        return Response(ChapterSerializer(chapter).data)
+
+
+class ModuleDetailView(APIView):
+    """Return one persisted module and its exact source text."""
+
+    def get(self, request, module_id):
+        module = get_object_or_404(
+            LearningModule.objects.select_related("chapter"),
+            pk=module_id,
+        )
+        return Response(LearningModuleSerializer(module).data)
 
 
 class MicroModuleListCreateView(APIView):
@@ -53,14 +79,12 @@ class MicroModuleDetailView(APIView):
         return Response(MicroModuleSerializer(micro_module).data)
 
 
-from .services.remediation_service import generate_remediation_lesson
-
-
 class AssessmentGenerateView(APIView):
 
     def post(self, request):
         micro_module_data = request.data.get("micro_module")
         micro_module_id = request.data.get("micro_module_id")
+        chapter_id = request.data.get("chapter_id")
         num_mcqs = request.data.get("num_mcqs", 5)
         num_subjective = request.data.get("num_subjective", 2)
         pass_percentage = request.data.get("pass_percentage", 70)
@@ -68,10 +92,12 @@ class AssessmentGenerateView(APIView):
         source_text = ""
         title = ""
         micro_module = None
+        chapter = None
         micro_module_ref = ""
+        chapter_ref = ""
         previous_questions = []
 
-        # Option A: Loaded from Database
+        # Option A: Loaded from MicroModule
         if micro_module_id:
             try:
                 micro_module = MicroModule.objects.get(pk=micro_module_id)
@@ -79,14 +105,12 @@ class AssessmentGenerateView(APIView):
                 title = micro_module.title
                 micro_module_ref = str(micro_module.id)
 
-                # Fetch questions asked in past assessments for this micro-module to avoid duplicates
                 past_assessments = Assessment.objects.filter(micro_module=micro_module)
                 for past_ass in past_assessments:
                     for q in (past_ass.questions_data or []):
                         if q.get("question"):
                             previous_questions.append(q["question"])
 
-                # Set status to in_progress if not started
                 if micro_module.status == MicroModule.Status.NOT_STARTED:
                     micro_module.status = MicroModule.Status.IN_PROGRESS
                     micro_module.started_at = timezone.now()
@@ -95,13 +119,34 @@ class AssessmentGenerateView(APIView):
             except (MicroModule.DoesNotExist, ValueError):
                 return Response({"detail": "MicroModule not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # Option B: Passed directly in payload
+        # Option B: Loaded from Chapter
+        elif chapter_id:
+            try:
+                chapter = Chapter.objects.get(pk=chapter_id)
+                source_text = chapter.source_text
+                title = chapter.title
+                chapter_ref = str(chapter.id)
+
+                past_assessments = Assessment.objects.filter(chapter=chapter)
+                for past_ass in past_assessments:
+                    for q in (past_ass.questions_data or []):
+                        if q.get("question"):
+                            previous_questions.append(q["question"])
+
+                if chapter.status == Chapter.Status.NOT_STARTED:
+                    chapter.status = Chapter.Status.IN_PROGRESS
+                    chapter.started_at = timezone.now()
+                    chapter.save(update_fields=["status", "started_at", "updated_at"])
+
+            except (Chapter.DoesNotExist, ValueError):
+                return Response({"detail": "Chapter not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Option C: Direct payload
         elif micro_module_data:
             source_text = micro_module_data.get("source_text", "")
             title = micro_module_data.get("title", "")
             micro_module_ref = str(micro_module_data.get("id", ""))
 
-            # Fetch previous questions if micro_module_ref matches past assessments
             if micro_module_ref:
                 past_assessments = Assessment.objects.filter(micro_module_id_ref=micro_module_ref)
                 for past_ass in past_assessments:
@@ -110,7 +155,7 @@ class AssessmentGenerateView(APIView):
                             previous_questions.append(q["question"])
         else:
             return Response(
-                {"detail": "Either micro_module_id or micro_module payload is required."},
+                {"detail": "Either micro_module_id, chapter_id, or micro_module payload is required."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -129,7 +174,14 @@ class AssessmentGenerateView(APIView):
                 previous_questions=previous_questions
             )
 
+            assessment_type = (
+                Assessment.AssessmentType.CHAPTER if chapter else Assessment.AssessmentType.MICRO_MODULE
+            )
+
             assessment = Assessment.objects.create(
+                assessment_type=assessment_type,
+                chapter=chapter,
+                chapter_id_ref=chapter_ref,
                 micro_module=micro_module,
                 micro_module_id_ref=micro_module_ref,
                 title=title or "Assessment",
@@ -182,6 +234,8 @@ class AssessmentSubmitView(APIView):
             response_data = AssessmentAttemptSerializer(attempt).data
             if assessment.micro_module:
                 response_data["micro_module_status"] = assessment.micro_module.status
+            if assessment.chapter:
+                response_data["chapter_status"] = assessment.chapter.status
 
             return Response(response_data, status=status.HTTP_200_OK)
 
@@ -215,4 +269,3 @@ class RemediationGenerateView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-

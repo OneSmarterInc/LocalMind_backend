@@ -1,5 +1,73 @@
 from rest_framework import serializers
-from .models import Chapter, LearningModule, MicroModule, Assessment, AssessmentAttempt
+
+from .models import Assessment, AssessmentAttempt, Chapter, LearningModule, MicroModule
+
+
+class LearningModuleSerializer(serializers.ModelSerializer):
+    chapter_id = serializers.UUIDField(read_only=True)
+
+    class Meta:
+        model = LearningModule
+        fields = [
+            "id",
+            "title",
+            "order",
+            "chapter_id",
+            "source_text",
+            "start_page",
+            "end_page",
+            "is_user_edited",
+            "status",
+            "started_at",
+            "completed_at",
+        ]
+
+
+class ChapterSerializer(serializers.ModelSerializer):
+    document_id = serializers.UUIDField(read_only=True)
+    modules = LearningModuleSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Chapter
+        fields = [
+            "id",
+            "document_id",
+            "title",
+            "order",
+            "source_text",
+            "start_page",
+            "end_page",
+            "is_user_edited",
+            "status",
+            "started_at",
+            "completed_at",
+            "modules",
+        ]
+
+
+# Lightweight serializers used by the document structure API
+class LearningModuleStructureSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LearningModule
+        fields = [
+            "id",
+            "title",
+            "order",
+        ]
+
+
+class ChapterStructureSerializer(serializers.ModelSerializer):
+    modules = LearningModuleStructureSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Chapter
+        fields = [
+            "id",
+            "title",
+            "order",
+            "modules",
+        ]
+
 
 class MicroModuleSerializer(serializers.ModelSerializer):
     class Meta:
@@ -22,29 +90,14 @@ class MicroModuleSerializer(serializers.ModelSerializer):
         ]
 
 
-class ChapterSerializer(serializers.ModelSerializer):
-    micro_modules = MicroModuleSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = Chapter
-        fields = ["id", "title", "order", "is_user_edited", "micro_modules"]
-
-
-class LearningModuleSerializer(serializers.ModelSerializer):
-    chapters = ChapterSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = LearningModule
-        fields = ["id", "title", "order", "is_user_edited", "chapters"]
-
-
 class AssessmentQuestionStudentSerializer(serializers.Serializer):
     """
     Hides correct answers and explanations when serving question paper to student.
     """
     id = serializers.CharField()
+    type = serializers.CharField(default="mcq")
     question = serializers.CharField()
-    options = serializers.ListField(child=serializers.DictField())
+    options = serializers.ListField(child=serializers.DictField(), required=False)
 
 
 class AssessmentSerializer(serializers.ModelSerializer):
@@ -54,6 +107,8 @@ class AssessmentSerializer(serializers.ModelSerializer):
         model = Assessment
         fields = [
             "id",
+            "assessment_type",
+            "chapter",
             "micro_module",
             "micro_module_id_ref",
             "title",
@@ -79,7 +134,6 @@ class AssessmentSerializer(serializers.ModelSerializer):
         return student_questions
 
 
-
 class AssessmentAttemptSerializer(serializers.ModelSerializer):
     class Meta:
         model = AssessmentAttempt
@@ -94,4 +148,3 @@ class AssessmentAttemptSerializer(serializers.ModelSerializer):
             "detailed_results",
             "created_at",
         ]
-

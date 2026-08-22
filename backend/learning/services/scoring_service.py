@@ -1,5 +1,5 @@
 from django.utils import timezone
-from learning.models import AssessmentAttempt, MicroModule
+from learning.models import AssessmentAttempt, Chapter, MicroModule
 from learning.services.subjective_evaluator import evaluate_subjective_answer
 
 
@@ -10,7 +10,7 @@ def grade_assessment_attempt(assessment, submitted_answers):
     - MCQs (type="mcq"): Graded deterministically in Python.
     - Subjective (type="subjective"): Evaluated grounded in source_text & expected_rubric via LLM.
     - Calculates total score, percentage, passed boolean (percentage >= pass_percentage).
-    - Updates associated MicroModule status to 'completed' (if passed) or 'needs_review' (if failed).
+    - Updates associated MicroModule or Chapter status to 'completed' (if passed) or 'needs_review' (if failed).
     - Persists AssessmentAttempt record in SQLite.
     """
     questions = assessment.questions_data or []
@@ -21,7 +21,16 @@ def grade_assessment_attempt(assessment, submitted_answers):
 
     total_score = 0.0
     detailed_results = []
-    source_text = assessment.source_text or (assessment.micro_module.source_text if assessment.micro_module else "")
+
+    # Resolve source text from assessment, micro_module, or chapter micro_modules
+    source_text = assessment.source_text
+    if not source_text:
+        if assessment.micro_module:
+            source_text = assessment.micro_module.source_text or ""
+        elif assessment.chapter:
+            source_text = assessment.chapter.source_text or "\n\n".join(
+                mm.source_text for mm in assessment.chapter.micro_modules.all() if mm.source_text
+            )
 
     for q in questions:
         q_id = str(q.get("id"))
@@ -75,7 +84,7 @@ def grade_assessment_attempt(assessment, submitted_answers):
             })
 
     percentage = round((total_score / float(total_questions)) * 100.0, 1)
-    pass_threshold = assessment.pass_percentage or 80
+    pass_threshold = assessment.pass_percentage or 70
     passed = percentage >= pass_threshold
 
     # Record attempt in DB
@@ -100,6 +109,24 @@ def grade_assessment_attempt(assessment, submitted_answers):
             module.status = MicroModule.Status.NEEDS_REVIEW
 
         module.save(update_fields=["status", "completed_at", "updated_at"])
+
+        # If micro_module has a parent chapter, ensure chapter is at least in_progress
+        if module.chapter and module.chapter.status == Chapter.Status.NOT_STARTED:
+            module.chapter.status = Chapter.Status.IN_PROGRESS
+            module.chapter.started_at = timezone.now()
+            module.chapter.save(update_fields=["status", "started_at", "updated_at"])
+
+    # Update Chapter progress status if chapter is associated directly
+    if assessment.chapter:
+        chapter = assessment.chapter
+        if passed:
+            chapter.status = Chapter.Status.COMPLETED
+            if not chapter.completed_at:
+                chapter.completed_at = timezone.now()
+        else:
+            chapter.status = Chapter.Status.NEEDS_REVIEW
+
+        chapter.save(update_fields=["status", "completed_at", "updated_at"])
 
     return attempt
 

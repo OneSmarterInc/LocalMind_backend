@@ -1,10 +1,14 @@
 from pathlib import Path
+
 from django.conf import settings
 from rest_framework import serializers
+
+from learning.serializers import ChapterSerializer
+
 from .models import Document
-from learning.serializers import LearningModuleSerializer
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc"}
+
 
 class DocumentUploadSerializer(serializers.ModelSerializer):
     class Meta:
@@ -19,10 +23,10 @@ class DocumentUploadSerializer(serializers.ModelSerializer):
                 "Supported files are PDF (.pdf), Word (.docx), and legacy Word (.doc)."
             )
 
-        max_bytes = settings.LOCALMIND_MAX_UPLOAD_MB * 1024 * 1024
+        max_bytes = getattr(settings, "LOCALMIND_MAX_UPLOAD_MB", 50) * 1024 * 1024
         if value.size > max_bytes:
             raise serializers.ValidationError(
-                f"File is larger than {settings.LOCALMIND_MAX_UPLOAD_MB} MB."
+                f"File is larger than {getattr(settings, 'LOCALMIND_MAX_UPLOAD_MB', 50)} MB."
             )
 
         if value.size == 0:
@@ -30,8 +34,9 @@ class DocumentUploadSerializer(serializers.ModelSerializer):
 
         return value
 
+
 class DocumentSerializer(serializers.ModelSerializer):
-    modules = LearningModuleSerializer(many=True, read_only=True)
+    chapters = ChapterSerializer(many=True, read_only=True)
 
     class Meta:
         model = Document
@@ -46,5 +51,5 @@ class DocumentSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "outline_confirmed_at",
-            "modules",
+            "chapters",
         ]
