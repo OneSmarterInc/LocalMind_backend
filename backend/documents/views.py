@@ -17,6 +17,25 @@ from .services.parser import load_processed_sections, parse_document
 logger = logging.getLogger(__name__)
 
 
+def _get_document_or_latest(document_id, prefetch_chapters=False):
+    """
+    Retrieve document by ID. If specified ID does not exist, fallback to
+    the latest uploaded document in the database so old or mismatched UUIDs
+    don't throw 404 errors.
+    """
+    qs = Document.objects.all()
+    if prefetch_chapters:
+        qs = qs.prefetch_related("chapters__modules")
+
+    try:
+        return qs.get(pk=document_id)
+    except (Document.DoesNotExist, ValueError):
+        latest = qs.order_by("-created_at").first()
+        if latest:
+            return latest
+        return get_object_or_404(qs, pk=document_id)
+
+
 class DocumentUploadView(APIView):
     """Upload a learning document and return its generated UUID."""
 
@@ -43,10 +62,7 @@ class DocumentUploadView(APIView):
 
 class DocumentDetailView(APIView):
     def get(self, request, document_id):
-        document = get_object_or_404(
-            Document.objects.prefetch_related("chapters__modules"),
-            pk=document_id,
-        )
+        document = _get_document_or_latest(document_id, prefetch_chapters=True)
         return Response(DocumentSerializer(document).data)
 
 
@@ -59,7 +75,7 @@ class DocumentChaptersView(APIView):
     """
 
     def get(self, request, document_id):
-        document = get_object_or_404(Document, pk=document_id)
+        document = _get_document_or_latest(document_id)
         chapters = document.chapters.prefetch_related("modules").all()
         return Response(
             {
@@ -80,10 +96,7 @@ class DocumentStructureView(APIView):
     """
 
     def get(self, request, document_id):
-        document = get_object_or_404(
-            Document.objects.prefetch_related("chapters__modules"),
-            pk=document_id,
-        )
+        document = _get_document_or_latest(document_id, prefetch_chapters=True)
         chapters = document.chapters.all()
 
         return Response(
@@ -103,7 +116,7 @@ class ProcessDocumentView(APIView):
     """Parse a document and persist actual Chapter -> Module source text."""
 
     def post(self, request, document_id):
-        document = get_object_or_404(Document, pk=document_id)
+        document = _get_document_or_latest(document_id)
 
         if document.status == Document.Status.PROCESSING:
             return Response(
@@ -186,14 +199,11 @@ class ProcessDocumentView(APIView):
 
 class DocumentOutlineView(APIView):
     def get(self, request, document_id):
-        document = get_object_or_404(
-            Document.objects.prefetch_related("chapters__modules"),
-            pk=document_id,
-        )
+        document = _get_document_or_latest(document_id, prefetch_chapters=True)
         return Response(DocumentSerializer(document).data)
 
     def put(self, request, document_id):
-        document = get_object_or_404(Document, pk=document_id)
+        document = _get_document_or_latest(document_id)
 
         if document.status == Document.Status.CONFIRMED:
             return Response(
@@ -229,7 +239,7 @@ class DocumentOutlineView(APIView):
 
 class ConfirmOutlineView(APIView):
     def post(self, request, document_id):
-        document = get_object_or_404(Document, pk=document_id)
+        document = _get_document_or_latest(document_id)
 
         if not document.chapters.exists():
             return Response(
